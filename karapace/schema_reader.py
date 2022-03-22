@@ -24,8 +24,7 @@ from karapace.protobuf.exception import (
 from karapace.protobuf.schema import ProtobufSchema
 from karapace.statsd import StatsClient
 from karapace.utils import json_encode, KarapaceKafkaClient
-from queue import Queue
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import Dict, Optional
 
 import json
@@ -34,6 +33,7 @@ import time
 import ujson
 
 log = logging.getLogger(__name__)
+Offset = int
 
 
 def parse_avro_schema_definition(s: str) -> AvroSchema:
@@ -86,6 +86,43 @@ class SchemaType(str, Enum):
     AVRO = "AVRO"
     JSONSCHEMA = "JSON"
     PROTOBUF = "PROTOBUF"
+
+
+class OffsetsWatcher:
+    """Synchronization container for threads to wait until an offset is seen.
+
+    This works under the assumption offsets are used only once, which should be
+    correct as long as no unclean leader election is performed.
+    """
+
+    def __init__(self) -> None:
+        # Lock used to protected _events, any modifications to that object must
+        # be performed with this lock acquired
+        self._events_lock = Lock()
+        self._events: Dict[Offset, Event] = dict()
+
+    def offset_seen(self, new_offset: int) -> None:
+        with self._events_lock:
+            # Note: The reader thread could be already waiting on the offset,
+            # in that case the existing object must be used, otherwise a new
+            # one is created.
+            event = self._events.setdefault(new_offset, Event())
+            event.set()
+
+    def wait_for_offset(self, expected_offset: int, timeout: int) -> bool:
+        """Block until expected_offset is seen."""
+        with self._events_lock:
+            # Note: The writer thread could be already seen the offset, in that
+            # case the existing object must be used, otherwise a new one is
+            # created.
+            event = self._events.setdefault(expected_offset, Event())
+
+        result = event.wait(timeout=timeout)
+
+        with self._events_lock:
+            del self._events[expected_offset]
+
+        return result
 
 
 class TypedSchema:
@@ -177,7 +214,7 @@ class KafkaSchemaReader(Thread):
         self.schema_topic = None
         self.topic_replication_factor = self.config["replication_factor"]
         self.consumer = None
-        self.queue = Queue()
+        self.offset_watcher = OffsetsWatcher()
         self.ready = False
         self.running = True
         self.id_lock = Lock()
@@ -334,7 +371,7 @@ class KafkaSchemaReader(Thread):
                 self.offset = msg.offset
                 self.log.info("Handled message, current offset: %r", self.offset)
                 if self.ready and add_offsets:
-                    self.queue.put(self.offset)
+                    self.offset_watcher.offset_seen(self.offset)
 
     def handle_msg(self, key: dict, value: dict):
         if key["keytype"] == "CONFIG":
